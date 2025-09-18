@@ -1,0 +1,15 @@
+{
+  "eslint.workingDirectories": [{ "mode": "auto" }],
+  "editor.formatOnSave": true,
+  "editor.codeActionsOnSave": ["source.fixAll.eslint"],
+  "editor.detectIndentation": true,
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+  "files.trimTrailingWhitespace": true,
+  "files.trimFinalNewlines": true,
+  "[javascript]": {
+    "editor.formatOnSave": false
+  },
+  "githubPullRequests.ignoredPullRequestBranches": ["develop"],
+  "cSpell.words": ["accesstrade"]
+}
