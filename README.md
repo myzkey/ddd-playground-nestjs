@@ -153,7 +153,11 @@ export class Assignment {
 }
 ```
 
-#### 集約間の整合性はアプリケーション層で管理
+#### 集約間の整合性管理の選択肢
+
+集約間の整合性管理は複数のアプローチがあります：
+
+**🎯 アプローチ1: アプリケーション層で直接管理**
 
 ```typescript
 // app/assignment/accept-assignment.usecase.ts
@@ -177,6 +181,115 @@ export class AcceptAssignmentUseCase {
   }
 }
 ```
+
+**🎯 アプローチ2: ドメインサービスで複雑なビジネスロジックを管理**
+
+```typescript
+// domain/assignment/service/assignment-coordination.service.ts
+export class AssignmentCoordinationService {
+  constructor(
+    private readonly orderRepository: IOrderRepository,
+    private readonly assignmentRepository: IAssignmentRepository,
+    private readonly deliveryEventRepository: IDeliveryEventRepository
+  ) {}
+
+  async acceptAssignmentWithOrderUpdate(
+    assignment: Assignment
+  ): Promise<{ assignment: Assignment; order: Order }> {
+    // 複雑なビジネスルールをドメインサービスでカプセル化
+    if (!assignment.canBeAccepted()) {
+      throw new Error('この割り当ては受諾できません')
+    }
+
+    const order = await this.orderRepository.findById(assignment.orderId)
+    if (!order.canBeAssigned()) {
+      throw new Error('この注文は割り当て不可能な状態です')
+    }
+
+    // 集約間の調整ロジック
+    assignment.accept()
+    order.assign()
+
+    // ドメインイベント発行
+    const event = new DeliveryEvent({
+      orderId: order.id,
+      type: new EventType(EventTypeValue.ASSIGNMENT_ACCEPTED),
+      payloadJson: JSON.stringify({ assignmentId: assignment.id.value })
+    })
+    await this.deliveryEventRepository.save(event)
+
+    return { assignment, order }
+  }
+}
+```
+
+```typescript
+// app/assignment/accept-assignment.usecase.ts（ドメインサービス利用版）
+export class AcceptAssignmentUseCase {
+  constructor(
+    private readonly assignmentRepository: IAssignmentRepository,
+    private readonly orderRepository: IOrderRepository,
+    private readonly assignmentCoordinationService: AssignmentCoordinationService
+  ) {}
+
+  async execute(assignmentId: string): Promise<Assignment> {
+    const assignment = await this.assignmentRepository.findById(new AssignmentId(assignmentId))
+
+    // ドメインサービスに複雑な調整ロジックを委譲
+    const { assignment: updatedAssignment, order } =
+      await this.assignmentCoordinationService.acceptAssignmentWithOrderUpdate(assignment)
+
+    // 永続化
+    await this.assignmentRepository.update(updatedAssignment)
+    await this.orderRepository.update(order)
+
+    return updatedAssignment
+  }
+}
+```
+
+**🎯 アプローチ3: イベント駆動による非同期整合性**
+
+```typescript
+// app/assignment/accept-assignment.usecase.ts（イベント駆動版）
+export class AcceptAssignmentUseCase {
+  async execute(assignmentId: string): Promise<Assignment> {
+    const assignment = await this.assignmentRepository.findById(new AssignmentId(assignmentId))
+    assignment.accept()
+    const updatedAssignment = await this.assignmentRepository.update(assignment)
+
+    // イベント発行のみ（非同期で他の集約を更新）
+    const event = new DeliveryEvent({
+      orderId: assignment.orderId,
+      type: new EventType(EventTypeValue.ASSIGNMENT_ACCEPTED),
+      payloadJson: JSON.stringify({ assignmentId: assignmentId })
+    })
+    await this.deliveryEventRepository.save(event)
+
+    return updatedAssignment
+  }
+}
+
+// 別のイベントハンドラーでOrder集約を更新
+// app/order/event-handler/assignment-accepted.handler.ts
+export class AssignmentAcceptedEventHandler {
+  async handle(event: DeliveryEvent): Promise<void> {
+    if (event.type.value === EventTypeValue.ASSIGNMENT_ACCEPTED) {
+      const order = await this.orderRepository.findById(event.orderId)
+      order.assign()
+      await this.orderRepository.update(order)
+    }
+  }
+}
+```
+
+#### 選択指針
+
+| アプローチ | 適用場面 | メリット | デメリット |
+|---------|---------|---------|----------|
+| **アプリケーション層直接管理** | シンプルな集約間連携 | 実装が分かりやすい | UseCaseが複雑になりがち |
+| **ドメインサービス** | 複雑なビジネスルール | ドメインロジックの適切な場所 | 過度に使うとドメインサービスが肥大化 |
+| **イベント駆動** | 疎結合が重要な場合 | 高い拡張性と非同期処理 | 複雑性とデバッグ困難 |
 
 ### 4. 値オブジェクト（Value Object）
 
@@ -208,6 +321,342 @@ export class Address {
 - プリミティブ型をラップして意味を明確化
 - バリデーションロジックをカプセル化
 - 不変性によりバグを防止
+
+### 4.5. エンティティの不変性（設計判断）
+
+エンティティを不変（イミュータブル）にするかどうかは設計チームで議論すべき内容
+
+#### 🔄 ミュータブルなエンティティ（従来アプローチ）
+
+```typescript
+// domain/order/entity/order.ts
+export class Order {
+  private _id: OrderId
+  private _status: OrderStatus
+  private _customerId: CustomerId
+  private _address: Address
+
+  constructor(props: OrderProps) {
+    this._id = props.id
+    this._status = props.status
+    this._customerId = props.customerId
+    this._address = props.address
+  }
+
+  // 状態を直接変更
+  markReadyToShip(): void {
+    if (this._status.value !== OrderStatusType.PLACED) {
+      throw new Error('PLACED状態の注文のみ出荷準備完了にできます')
+    }
+    this._status = new OrderStatus(OrderStatusType.READY_TO_SHIP)  // 直接変更
+  }
+
+  // ゲッター
+  get id(): OrderId { return this._id }
+  get status(): OrderStatus { return this._status }
+  get customerId(): CustomerId { return this._customerId }
+  get address(): Address { return this._address }
+}
+```
+
+#### 🛡️ イミュータブルなエンティティ（関数型アプローチ）
+
+```typescript
+// domain/order/entity/order.ts
+export class Order {
+  private readonly _id: OrderId
+  private readonly _status: OrderStatus
+  private readonly _customerId: CustomerId
+  private readonly _address: Address
+
+  constructor(props: OrderProps) {
+    this._id = props.id
+    this._status = props.status
+    this._customerId = props.customerId
+    this._address = props.address
+  }
+
+  // 新しいインスタンスを返す
+  markReadyToShip(): Order {
+    if (this._status.value !== OrderStatusType.PLACED) {
+      throw new Error('PLACED状態の注文のみ出荷準備完了にできます')
+    }
+
+    return new Order({
+      id: this._id,
+      status: new OrderStatus(OrderStatusType.READY_TO_SHIP),  // 新しいインスタンス
+      customerId: this._customerId,
+      address: this._address
+    })
+  }
+
+  // ゲッター
+  get id(): OrderId { return this._id }
+  get status(): OrderStatus { return this._status }
+  get customerId(): CustomerId { return this._customerId }
+  get address(): Address { return this._address }
+}
+```
+
+```typescript
+// 使用方法の違い
+// ミュータブル版
+const order = new Order({...})
+order.markReadyToShip()  // order自身が変更される
+await repository.save(order)
+
+// イミュータブル版
+const order = new Order({...})
+const updatedOrder = order.markReadyToShip()  // 新しいインスタンスが返される
+await repository.save(updatedOrder)
+```
+
+#### 比較：メリット・デメリット
+
+| 観点 | ミュータブル | イミュータブル |
+|------|-------------|---------------|
+| **パフォーマンス** | ✅ オブジェクト作成コストが低い | ❌ 毎回新しいインスタンス作成 |
+| **メモリ使用量** | ✅ 少ない | ❌ 多い（古いインスタンスもGCまで残る） |
+| **並行処理安全性** | ❌ 共有状態の競合リスク | ✅ 完全にスレッドセーフ |
+| **デバッグしやすさ** | ❌ 状態変更の追跡が困難 | ✅ 状態変更が明示的 |
+| **テストしやすさ** | ❌ 副作用のあるメソッドテスト | ✅ 純粋関数的テスト |
+| **ORM連携** | ✅ ActiveRecordパターンとマッチ | ❌ Repository実装が複雑化 |
+| **複雑な状態変更** | ✅ 直感的 | ❌ Builder等のパターンが必要 |
+| **実装の自然さ** | ✅ 一般的なOOP | ❌ 関数型プログラミング的 |
+
+#### 実践的な判断指針
+
+**ミュータブルを選ぶべき場合：**
+- パフォーマンスが重要なシステム
+- チームがOOPに慣れている
+- 複雑な状態遷移が多い
+- ActiveRecordパターンを使いたい
+
+**イミュータブルを選ぶべき場合：**
+- 並行処理が多いシステム
+- 関数型プログラミングに慣れている
+- 状態変更の追跡可能性が重要
+- 副作用のないテストを重視
+
+**💡 推奨：ハイブリッドアプローチ**
+
+プロジェクトの性質に応じて使い分け：
+
+```typescript
+// シンプルなエンティティ：ミュータブル
+export class Customer {
+  updateEmail(email: Email): void {
+    this._email = email
+  }
+}
+
+// 複雑なビジネスルールのエンティティ：イミュータブル
+export class Order {
+  processPayment(amount: Money): Order {
+    return new Order({...this, status: OrderStatus.PAID})
+  }
+}
+```
+
+**重要：チーム内で一貫性を保つことが最も重要。**
+
+### 4.6. 副作用（Side Effects）の管理
+
+DDDにおいて副作用の適切な管理は、ドメインロジックの純粋性を保つために重要です。
+
+#### ❌ 悪い例：ドメインモデルに副作用が混入
+
+```typescript
+// ドメイン層で副作用を持つ（NG）
+export class Order {
+  markReadyToShip(): void {
+    if (this._status.value !== OrderStatusType.PLACED) {
+      throw new Error('PLACED状態の注文のみ出荷準備完了にできます')
+    }
+
+    this._status = new OrderStatus(OrderStatusType.READY_TO_SHIP)
+
+    // ❌ ドメインモデル内でDB操作（副作用）
+    database.save(this)
+
+    // ❌ ドメインモデル内で外部API呼び出し（副作用）
+    emailService.sendNotification(this._customerId, 'Order is ready to ship')
+
+    // ❌ ドメインモデル内でログ出力（副作用）
+    logger.info(`Order ${this._id} is ready to ship`)
+  }
+}
+```
+
+#### ✅ 良い例：副作用を適切に分離
+
+```typescript
+// ドメインモデル：純粋なビジネスロジックのみ
+export class Order {
+  markReadyToShip(): void {
+    if (this._status.value !== OrderStatusType.PLACED) {
+      throw new Error('PLACED状態の注文のみ出荷準備完了にできます')
+    }
+    this._status = new OrderStatus(OrderStatusType.READY_TO_SHIP)
+    // 副作用なし、状態変更のみ
+  }
+}
+
+// アプリケーション層：副作用を適切に管理
+export class MarkOrderReadyToShipUseCase {
+  constructor(
+    private readonly orderRepository: IOrderRepository,
+    private readonly notificationService: INotificationService,
+    private readonly logger: ILogger
+  ) {}
+
+  async execute(orderId: OrderId): Promise<Order> {
+    // 1. ドメインロジック実行（副作用なし）
+    const order = await this.orderRepository.findById(orderId)
+    order.markReadyToShip()
+
+    // 2. 副作用を明示的に実行
+    const updatedOrder = await this.orderRepository.save(order)  // DB操作
+
+    // 3. 外部システムとの連携
+    await this.notificationService.sendReadyToShipNotification(
+      order.customerId,
+      order.id
+    )
+
+    // 4. ログ出力
+    this.logger.info(`Order ${order.id.value} marked as ready to ship`)
+
+    return updatedOrder
+  }
+}
+```
+
+#### 副作用の種類と管理方針
+
+| 副作用の種類 | 例 | 管理場所 | 注意点 |
+|-------------|---|---------|--------|
+| **データ永続化** | DB保存、ファイル書き込み | アプリケーション層 | Repository経由で抽象化 |
+| **外部API呼び出し** | メール送信、決済処理 | アプリケーション層 | インターフェース経由で依存性注入 |
+| **ログ出力** | アプリケーションログ | アプリケーション層 | 構造化ログを推奨 |
+| **イベント発行** | ドメインイベント | アプリケーション層 | イベントソーシング考慮 |
+| **時刻取得** | 現在時刻の参照 | 値オブジェクトまたはサービス | テスト可能性のため注入 |
+| **ランダム値生成** | UUID生成 | 値オブジェクトまたはサービス | 決定的テストのため注入 |
+
+#### ドメインサービスでの副作用管理
+
+```typescript
+// ドメインサービス：複雑なビジネスルールだが副作用は最小限
+export class OrderValidationService {
+  constructor(
+    private readonly orderRepository: IOrderRepository  // 読み取り専用
+  ) {}
+
+  async canBeShipped(order: Order): Promise<boolean> {
+    // 読み取り専用の副作用は許容される場合がある
+    const relatedOrders = await this.orderRepository.findByCustomerId(order.customerId)
+
+    // ビジネスルール判定（副作用なし）
+    return relatedOrders.every(o => o.status.canCoexistWithShipping())
+  }
+}
+```
+
+#### 時刻やID生成の副作用対策
+
+```typescript
+// ❌ 副作用のあるドメインモデル
+export class Order {
+  static create(customerId: CustomerId, address: Address): Order {
+    return new Order({
+      id: new OrderId(crypto.randomUUID()),  // ❌ 非決定的
+      customerId,
+      address,
+      createdAt: new Date(),  // ❌ 非決定的
+      status: new OrderStatus(OrderStatusType.PLACED)
+    })
+  }
+}
+
+// ✅ 副作用を外部から注入
+export class Order {
+  static create(
+    id: OrderId,  // 外部から注入
+    customerId: CustomerId,
+    address: Address,
+    createdAt: Date  // 外部から注入
+  ): Order {
+    return new Order({
+      id,
+      customerId,
+      address,
+      createdAt,
+      status: new OrderStatus(OrderStatusType.PLACED)
+    })
+  }
+}
+
+// アプリケーション層で副作用を管理
+export class PlaceOrderUseCase {
+  constructor(
+    private readonly orderRepository: IOrderRepository,
+    private readonly idGenerator: IIdGenerator,
+    private readonly timeProvider: ITimeProvider
+  ) {}
+
+  async execute(params: PlaceOrderParams): Promise<Order> {
+    const order = Order.create(
+      this.idGenerator.generateOrderId(),  // 副作用を注入
+      params.customerId,
+      params.address,
+      this.timeProvider.now()  // 副作用を注入
+    )
+
+    return await this.orderRepository.save(order)
+  }
+}
+```
+
+#### テストにおける副作用の扱い
+
+```typescript
+// ドメインモデルのテスト：副作用がないため簡単
+describe('Order', () => {
+  it('should mark as ready to ship when status is PLACED', () => {
+    const order = new Order({
+      id: new OrderId('test-id'),
+      status: new OrderStatus(OrderStatusType.PLACED),
+      // ...
+    })
+
+    order.markReadyToShip()  // 副作用なし、テストしやすい
+
+    expect(order.status.value).toBe(OrderStatusType.READY_TO_SHIP)
+  })
+})
+
+// UseCase のテスト：副作用をモック化
+describe('MarkOrderReadyToShipUseCase', () => {
+  it('should mark order and send notification', async () => {
+    const mockRepository = { save: jest.fn(), findById: jest.fn() }
+    const mockNotificationService = { sendReadyToShipNotification: jest.fn() }
+    const useCase = new MarkOrderReadyToShipUseCase(mockRepository, mockNotificationService)
+
+    await useCase.execute(new OrderId('test-id'))
+
+    expect(mockRepository.save).toHaveBeenCalled()
+    expect(mockNotificationService.sendReadyToShipNotification).toHaveBeenCalled()
+  })
+})
+```
+
+#### 副作用管理の原則
+
+1. **ドメイン層は副作用フリー**: ビジネスロジックに集中
+2. **アプリケーション層で副作用を統制**: UseCase が責任を持つ
+3. **依存性注入で副作用を抽象化**: テスト可能性を確保
+4. **読み取り専用の副作用は慎重に判断**: ドメインサービスで限定的に許容
+5. **副作用の境界を明確化**: どこで何の副作用が発生するかを明示
 
 ### 5. ドメインイベント
 
