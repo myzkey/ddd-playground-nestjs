@@ -658,7 +658,312 @@ describe('MarkOrderReadyToShipUseCase', () => {
 4. **読み取り専用の副作用は慎重に判断**: ドメインサービスで限定的に許容
 5. **副作用の境界を明確化**: どこで何の副作用が発生するかを明示
 
-### 5. ドメインイベント
+### 5. CQRS（コマンドクエリ責務分離）
+
+CQRSは読み取り（Query）と書き込み（Command）の責務を分離するパターンです。DDDと組み合わせることで、複雑なドメインモデルと効率的な読み取りを両立できます。
+
+#### 基本概念
+
+```
+                    ┌─────────────────┐
+                    │   Application   │
+                    └─────────────────┘
+                            │
+                ┌───────────┴───────────┐
+                │                       │
+        ┌───────▼──────┐       ┌───────▼──────┐
+        │   Command    │       │    Query     │
+        │   (Write)    │       │    (Read)    │
+        └──────────────┘       └──────────────┘
+                │                       │
+        ┌───────▼──────┐       ┌───────▼──────┐
+        │ Write Model  │       │  Read Model  │
+        │ (Domain)     │       │ (Projection) │
+        └──────────────┘       └──────────────┘
+                │                       │
+        ┌───────▼──────┐       ┌───────▼──────┐
+        │  Write DB    │       │   Read DB    │
+        │ (Normalized) │       │(Denormalized)│
+        └──────────────┘       └──────────────┘
+```
+
+#### 🎯 アプローチ1: シンプルなCQRS（同一DB）
+
+```typescript
+// Command側（書き込み）- ドメインモデル使用
+export class PlaceOrderUseCase {
+  constructor(
+    private readonly orderRepository: IOrderRepository,
+    private readonly deliveryEventRepository: IDeliveryEventRepository
+  ) {}
+
+  async execute(params: PlaceOrderParams): Promise<OrderId> {
+    // ドメインモデルでビジネスロジックを実行
+    const order = new Order({
+      id: new OrderId(params.orderId),
+      customerId: new CustomerId(params.customerId),
+      address: new Address(params.address),
+      status: new OrderStatus(OrderStatusType.PLACED)
+    })
+
+    await this.orderRepository.save(order)
+    
+    // イベント発行
+    const event = new DeliveryEvent({
+      orderId: order.id,
+      type: new EventType(EventTypeValue.ORDER_PLACED),
+      payloadJson: JSON.stringify(params)
+    })
+    await this.deliveryEventRepository.save(event)
+
+    return order.id
+  }
+}
+
+// Query側（読み取り）- 専用DTOで効率化
+export class OrderQueryService {
+  constructor(
+    @InjectRepository(OrderOrmEntity)
+    private readonly orderRepository: Repository<OrderOrmEntity>,
+  ) {}
+
+  // 単純な読み取り用DTO
+  async findOrderSummary(orderId: string): Promise<OrderSummaryDto> {
+    // 複雑なJOINやProjectionを使用
+    const result = await this.orderRepository
+      .createQueryBuilder('order')
+      .leftJoin('order.customer', 'customer')
+      .leftJoin('order.deliveryEvents', 'events')
+      .select([
+        'order.id',
+        'order.status',
+        'order.address',
+        'customer.name',
+        'customer.email',
+        'COUNT(events.id) as eventCount'
+      ])
+      .where('order.id = :orderId', { orderId })
+      .groupBy('order.id')
+      .getRawOne()
+
+    return {
+      orderId: result.order_id,
+      customerName: result.customer_name,
+      customerEmail: result.customer_email,
+      status: result.order_status,
+      address: result.order_address,
+      eventCount: parseInt(result.eventCount)
+    }
+  }
+
+  // リスト表示用の最適化されたクエリ
+  async findOrderList(filters: OrderListFilters): Promise<OrderListDto[]> {
+    const query = this.orderRepository
+      .createQueryBuilder('order')
+      .leftJoin('order.customer', 'customer')
+      .select([
+        'order.id',
+        'order.status', 
+        'order.createdAt',
+        'customer.name'
+      ])
+
+    if (filters.status) {
+      query.where('order.status = :status', { status: filters.status })
+    }
+
+    if (filters.customerId) {
+      query.andWhere('order.customerId = :customerId', { customerId: filters.customerId })
+    }
+
+    const results = await query
+      .orderBy('order.createdAt', 'DESC')
+      .limit(filters.limit || 50)
+      .offset(filters.offset || 0)
+      .getMany()
+
+    return results.map(order => ({
+      orderId: order.id,
+      customerName: order.customer.name,
+      status: order.status,
+      createdAt: order.createdAt
+    }))
+  }
+}
+```
+
+#### 🎯 アプローチ2: イベントソーシング + プロジェクション
+
+```typescript
+// Command側 - イベントを保存
+export class PlaceOrderUseCase {
+  async execute(params: PlaceOrderParams): Promise<OrderId> {
+    const orderId = new OrderId(params.orderId)
+    
+    // ドメインモデルでビジネスロジック実行
+    const order = new Order({...params})
+    
+    // ドメインイベントとして保存
+    const events = order.getUncommittedEvents()
+    await this.eventStore.saveEvents(orderId, events)
+    
+    return orderId
+  }
+}
+
+// プロジェクション - イベントから読み取り用データを構築
+export class OrderProjectionHandler {
+  constructor(
+    private readonly orderReadModelRepository: IOrderReadModelRepository
+  ) {}
+
+  async handle(event: DeliveryEvent): Promise<void> {
+    switch (event.type.value) {
+      case EventTypeValue.ORDER_PLACED:
+        await this.createOrderProjection(event)
+        break
+      case EventTypeValue.ORDER_STATUS_CHANGED:
+        await this.updateOrderStatus(event)
+        break
+    }
+  }
+
+  private async createOrderProjection(event: DeliveryEvent): Promise<void> {
+    const payload = JSON.parse(event.payloadJson)
+    const projection = new OrderReadModel({
+      orderId: event.orderId.value,
+      customerId: payload.customerId,
+      customerName: payload.customerName, // 非正規化
+      address: payload.address,
+      status: payload.status,
+      createdAt: event.occurredAt,
+      updatedAt: event.occurredAt
+    })
+    
+    await this.orderReadModelRepository.save(projection)
+  }
+}
+
+// Query側 - 最適化されたReadModelから読み取り
+export class OrderQueryService {
+  constructor(
+    private readonly orderReadModelRepository: IOrderReadModelRepository
+  ) {}
+
+  async findOrderSummary(orderId: string): Promise<OrderSummaryDto> {
+    // ReadModelから直接取得（JOINなし）
+    const readModel = await this.orderReadModelRepository.findById(orderId)
+    
+    return {
+      orderId: readModel.orderId,
+      customerName: readModel.customerName, // 既に非正規化済み
+      status: readModel.status,
+      address: readModel.address,
+      createdAt: readModel.createdAt
+    }
+  }
+}
+```
+
+#### 🎯 アプローチ3: 読み書き分離DB
+
+```typescript
+// Command側の設定
+@Module({
+  imports: [
+    TypeOrmModule.forRoot({
+      name: 'write',
+      type: 'postgres',
+      host: 'write-db-host',
+      database: 'orders_write',
+      entities: [OrderOrmEntity], // 正規化されたスキーマ
+    }),
+  ],
+})
+export class WriteModule {}
+
+// Query側の設定
+@Module({
+  imports: [
+    TypeOrmModule.forRoot({
+      name: 'read',
+      type: 'postgres', 
+      host: 'read-replica-host',
+      database: 'orders_read',
+      entities: [OrderReadModel], // 非正規化されたスキーマ
+    }),
+  ],
+})
+export class ReadModule {}
+
+// Command用Repository
+@Injectable()
+export class OrderRepository implements IOrderRepository {
+  constructor(
+    @InjectRepository(OrderOrmEntity, 'write')
+    private readonly repository: Repository<OrderOrmEntity>
+  ) {}
+
+  async save(order: Order): Promise<Order> {
+    // 書き込み専用DBに保存
+    const entity = this.toEntity(order)
+    await this.repository.save(entity)
+    return order
+  }
+}
+
+// Query用Service
+@Injectable()
+export class OrderQueryService {
+  constructor(
+    @InjectRepository(OrderReadModel, 'read')
+    private readonly readRepository: Repository<OrderReadModel>
+  ) {}
+
+  async findOrderSummary(orderId: string): Promise<OrderSummaryDto> {
+    // 読み取り専用DBから取得
+    const readModel = await this.readRepository.findOne({
+      where: { orderId }
+    })
+    return this.toDto(readModel)
+  }
+}
+```
+
+#### CQRSの利点とトレードオフ
+
+| 観点 | 利点 | 課題 |
+|------|------|------|
+| **パフォーマンス** | ✅ 読み取りクエリの最適化<br>✅ 書き込みとの競合回避 | ❌ データ同期のオーバーヘッド |
+| **スケーラビリティ** | ✅ 読み書きの独立スケーリング<br>✅ 読み取りレプリカ活用 | ❌ 複雑なインフラ構成 |
+| **データ設計** | ✅ 用途別最適化<br>✅ 非正規化による高速読み取り | ❌ データ重複とストレージ増加 |
+| **開発・保守** | ✅ 関心の分離<br>✅ ドメインモデルの純粋性 | ❌ 実装複雑度増加<br>❌ デバッグ困難 |
+| **整合性** | ✅ 書き込み側の強整合性 | ❌ 読み取り側の結果整合性 |
+
+#### 適用指針
+
+**CQRSを適用すべき場合：**
+- 読み取りと書き込みの要件が大きく異なる
+- 複雑な検索・レポート機能が必要
+- 高いパフォーマンスが求められる
+- スケーラビリティが重要
+
+**CQRSを避けるべき場合：**
+- シンプルなCRUDアプリケーション
+- チームがCQRSに不慣れ
+- リアルタイム整合性が必須
+- 開発・運用リソースが限られている
+
+**💡 段階的導入のすすめ：**
+
+```
+Phase 1: Repository分離    → Command/Query別Repository
+Phase 2: Service分離      → UseCase/QueryService分離  
+Phase 3: モデル分離       → WriteModel/ReadModel分離
+Phase 4: データベース分離  → 読み書きDB物理分離
+```
+
+### 6. ドメインイベント
 
 #### イベント駆動設計
 
